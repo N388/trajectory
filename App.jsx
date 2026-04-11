@@ -225,13 +225,22 @@ export default function App() {
   }, [connectTicker, connectDepth]);
 
   // ── Canvas DPR ───────────────────────────────────────────
+  // Resize canvas whenever window size changes
   useEffect(() => {
-    dpr.current = window.devicePixelRatio || 1;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    canvas.width  = rect.width  * dpr.current;
-    canvas.height = rect.height * dpr.current;
+    const resizeCanvas = () => {
+      dpr.current = window.devicePixelRatio || 1;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      canvas.width  = rect.width  * dpr.current;
+      canvas.height = rect.height * dpr.current;
+    };
+    resizeCanvas();
+    window.addEventListener("resize", resizeCanvas);
+    // Also resize after layout settles
+    const t = setTimeout(resizeCanvas, 100);
+    return () => { window.removeEventListener("resize", resizeCanvas); clearTimeout(t); };
   }, []);
 
   // ── Y-axis drag zoom (TradingView style) ────────────────
@@ -252,10 +261,12 @@ export default function App() {
       dragStartY.current  = e.clientY;
       dragStartZ.current  = yZoom.current;
       e.preventDefault();
+      e.stopPropagation();
     };
     const onMouseMove = (e) => {
       if (!isDraggingY.current) return;
-      const dy = dragStartY.current - e.clientY; // up = zoom in
+      e.preventDefault();
+      const dy = dragStartY.current - e.clientY;
       yZoom.current = Math.max(0.1, Math.min(10, dragStartZ.current * (1 + dy / 200)));
     };
     const onMouseUp = () => { isDraggingY.current = false; };
@@ -270,9 +281,12 @@ export default function App() {
       dragStartZ.current  = yZoom.current;
     };
     const onTouchMove = (e) => {
-      if (!isDraggingY.current || e.touches.length !== 1) return;
-      const dy = dragStartY.current - e.touches[0].clientY;
-      yZoom.current = Math.max(0.1, Math.min(10, dragStartZ.current * (1 + dy / 200)));
+      if ((!isDraggingY.current && !isDraggingX.current) || e.touches.length !== 1) return;
+      e.preventDefault(); // stop page scroll while dragging
+      if (isDraggingY.current) {
+        const dy = dragStartY.current - e.touches[0].clientY;
+        yZoom.current = Math.max(0.1, Math.min(10, dragStartZ.current * (1 + dy / 200)));
+      }
     };
     const onTouchEnd = () => { isDraggingY.current = false; };
 
@@ -300,13 +314,15 @@ export default function App() {
       isDraggingX.current  = true;
       dragStartX2.current  = e.clientX;
       dragStartXV.current  = xViewMin.current;
+      e.preventDefault();
+      e.stopPropagation();
     };
     const onMouseMoveX = (e) => {
       if (!isDraggingX.current) return;
+      e.preventDefault();
       const dx = e.clientX - dragStartX2.current;
       const factor = 1 - dx / 400;
       xViewMin.current = Math.max(5, Math.min(1440, dragStartXV.current * factor));
-      // user moved → stop auto-following
       autoFollow.current = false;
       setShowFollow(true);
     };
@@ -318,8 +334,8 @@ export default function App() {
     window.addEventListener("mousemove",  onMouseMoveX);
     window.addEventListener("mouseup",    onMouseUp);
     window.addEventListener("mouseup",    onMouseUpX);
-    canvas.addEventListener("touchstart", onTouchStart, { passive: true });
-    window.addEventListener("touchmove",  onTouchMove,  { passive: true });
+    canvas.addEventListener("touchstart", onTouchStart, { passive: false });
+    window.addEventListener("touchmove",  onTouchMove,  { passive: false });
     window.addEventListener("touchend",   onTouchEnd);
     canvas.addEventListener("dblclick",   onDblClick);
 
@@ -531,7 +547,7 @@ export default function App() {
     : "جاري الاتصال...";
 
   return (
-    <div style={{ background:"#040810", minHeight:"100vh", color:"#c0d0e0", fontFamily:"'Courier New',Courier,monospace", direction:"rtl", display:"flex", flexDirection:"column", alignItems:"center", padding:"14px 10px", gap:10 }}>
+    <div style={{ background:"#040810", height:"100vh", overflow:"hidden", color:"#c0d0e0", fontFamily:"'Courier New',Courier,monospace", direction:"rtl", display:"flex", flexDirection:"column", alignItems:"center", padding:"14px 10px", gap:8, boxSizing:"border-box" }}>
 
       <div style={{ width:"100%", maxWidth:880, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
         <div style={{ display:"flex", alignItems:"center", gap:8 }}>
@@ -568,8 +584,8 @@ export default function App() {
         </div>
       </div>
 
-      <div style={{ width:"100%", maxWidth:880, position:"relative" }}>
-        <canvas ref={canvasRef} style={{ width:"100%", height:460, borderRadius:8, border:"1px solid rgba(255,255,255,0.04)", display:"block", cursor:"crosshair" }} />
+      <div style={{ width:"100%", maxWidth:880, position:"relative", flex:1, minHeight:0, display:"flex", flexDirection:"column" }}>
+        <canvas ref={canvasRef} style={{ width:"100%", flex:1, minHeight:0, borderRadius:8, border:"1px solid rgba(255,255,255,0.04)", display:"block", cursor:"crosshair", touchAction:"none", userSelect:"none" }} />
         {showFollow && (
           <button onClick={() => {
             autoFollow.current = true;
