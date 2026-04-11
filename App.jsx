@@ -74,11 +74,18 @@ export default function App() {
   const wsTickRef  = useRef(null);
   const wsDepthRef = useRef(null);
   const livePrice  = useRef(null);
-  // ── Y-axis zoom (TradingView style) ──────────────────────
+  // ── Y-axis zoom ───────────────────────────────────────────
   const yZoom       = useRef(1);
   const isDraggingY = useRef(false);
   const dragStartY  = useRef(0);
   const dragStartZ  = useRef(1);
+
+  // ── X-axis zoom (horizontal) ───────────────────────────────
+  // viewMinutes: how many minutes to show looking back from now
+  const xViewMin    = useRef(60);   // default: show last 60 min
+  const isDraggingX = useRef(false);
+  const dragStartX2 = useRef(0);
+  const dragStartXV = useRef(60);
 
   const [info, setInfo] = useState({
     price: null, change24h: 0, bidPct: 50, askPct: 50,
@@ -222,13 +229,41 @@ export default function App() {
 
     // Double-click Y axis = reset zoom
     const onDblClick = (e) => {
-      if (!isOnYAxis(e.clientX)) return;
-      yZoom.current = 1;
+      const rect = canvas.getBoundingClientRect();
+      const x = (e.clientX - rect.left) * (canvas.width / rect.width) / (dpr.current || 1);
+      if (x < PL) {
+        yZoom.current = 1; // reset Y
+      } else {
+        xViewMin.current = 60; // reset X
+      }
     };
 
+    // X-axis drag: drag left/right on chart area to zoom time window
+    const isOnChart = (clientX) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = (clientX - rect.left) * (canvas.width / rect.width) / (dpr.current || 1);
+      return x >= PL;
+    };
+    const onMouseDownX = (e) => {
+      if (e.button !== 0 || !isOnChart(e.clientX)) return;
+      isDraggingX.current  = true;
+      dragStartX2.current  = e.clientX;
+      dragStartXV.current  = xViewMin.current;
+    };
+    const onMouseMoveX = (e) => {
+      if (!isDraggingX.current) return;
+      const dx = e.clientX - dragStartX2.current; // right = zoom out (more time)
+      const factor = 1 - dx / 400;
+      xViewMin.current = Math.max(5, Math.min(1440, dragStartXV.current * factor));
+    };
+    const onMouseUpX = () => { isDraggingX.current = false; };
+
     canvas.addEventListener("mousedown",  onMouseDown);
+    canvas.addEventListener("mousedown",  onMouseDownX);
     window.addEventListener("mousemove",  onMouseMove);
+    window.addEventListener("mousemove",  onMouseMoveX);
     window.addEventListener("mouseup",    onMouseUp);
+    window.addEventListener("mouseup",    onMouseUpX);
     canvas.addEventListener("touchstart", onTouchStart, { passive: true });
     window.addEventListener("touchmove",  onTouchMove,  { passive: true });
     window.addEventListener("touchend",   onTouchEnd);
@@ -236,8 +271,11 @@ export default function App() {
 
     return () => {
       canvas.removeEventListener("mousedown",  onMouseDown);
+      canvas.removeEventListener("mousedown",  onMouseDownX);
       window.removeEventListener("mousemove",  onMouseMove);
+      window.removeEventListener("mousemove",  onMouseMoveX);
       window.removeEventListener("mouseup",    onMouseUp);
+      window.removeEventListener("mouseup",    onMouseUpX);
       canvas.removeEventListener("touchstart", onTouchStart);
       window.removeEventListener("touchmove",  onTouchMove);
       window.removeEventListener("touchend",   onTouchEnd);
@@ -262,7 +300,7 @@ export default function App() {
 
     const PL = 74, PR = 14, PT = 20, PB = 38;
     const CW = W - PL - PR, CH = H - PT - PB;
-    const timeStart = now - HIST_MIN * 60000;
+    const timeStart = now - xViewMin.current * 60000;
     const timeEnd   = now + TRAJ_MIN * 60000;
     const timeRange = timeEnd - timeStart;
 
@@ -296,7 +334,8 @@ export default function App() {
 
     // Grid
     ctx.lineWidth = 1;
-    for (let m = -HIST_MIN; m <= TRAJ_MIN; m++) {
+    const gridStep = totalView <= 30 ? 2 : totalView <= 120 ? 10 : totalView <= 360 ? 30 : 60;
+    for (let m = -Math.ceil(xViewMin.current / gridStep) * gridStep; m <= TRAJ_MIN; m += gridStep) {
       const x = tx(now + m * 60000);
       if (x < PL - 1 || x > PL + CW + 1) continue;
       ctx.strokeStyle = "rgba(255,255,255,0.024)";
@@ -396,14 +435,28 @@ export default function App() {
       ctx.fillText(`$${safeNum(p).toFixed(0)}`, PL - 6, PT + (i / 5) * CH + 3);
     }
 
-    // X labels
+    // X labels — dynamic interval based on view window
     ctx.textAlign = "center";
-    for (let m = -4; m <= 10; m += 2) {
+    const totalView = xViewMin.current + TRAJ_MIN;
+    const step = totalView <= 30 ? 2 : totalView <= 120 ? 10 : totalView <= 360 ? 30 : 60;
+    const startM = -Math.ceil(xViewMin.current / step) * step;
+    for (let m = startM; m <= TRAJ_MIN; m += step) {
       const x = tx(now + m * 60000);
       if (x < PL || x > PL + CW) continue;
-      ctx.fillStyle = m === 0 ? "rgba(100,175,255,0.95)" : "rgba(65,95,135,0.65)";
-      ctx.font = m === 0 ? "bold 10px 'Courier New'" : "10px 'Courier New'";
-      ctx.fillText(m === 0 ? "الآن" : `${m > 0 ? "+" : ""}${m}د`, x, PT + CH + 22);
+      const isNow = m === 0;
+      ctx.fillStyle = isNow ? "rgba(100,175,255,0.95)" : "rgba(65,95,135,0.65)";
+      ctx.font = isNow ? "bold 10px 'Courier New'" : "10px 'Courier New'";
+      let label;
+      if (isNow) {
+        label = "الآن";
+      } else if (Math.abs(m) >= 60) {
+        const h = Math.floor(Math.abs(m) / 60);
+        const min2 = Math.abs(m) % 60;
+        label = `${m < 0 ? "-" : "+"}${h}س${min2 > 0 ? min2 + "د" : ""}`;
+      } else {
+        label = `${m > 0 ? "+" : ""}${m}د`;
+      }
+      ctx.fillText(label, x, PT + CH + 22);
     }
 
     ctx.restore();
@@ -461,7 +514,7 @@ export default function App() {
 
       <canvas ref={canvasRef} style={{ width:"100%", maxWidth:880, height:460, borderRadius:8, border:"1px solid rgba(255,255,255,0.04)", display:"block", cursor:"crosshair" }} />
       <div style={{ fontSize:9, color:"#1a2a3a", textAlign:"center" }}>
-        اسحبي على محور السعر (يسار) للتكبير والتصغير · دابل كليك للإعادة
+        سحب على أرقام السعر (يسار): تكبير/تصغير السعر · سحب على الرسم: تكبير/تصغير الوقت · دبل كليك: إعادة
       </div>
 
       <div style={{ display:"flex", gap:18, fontSize:10, color:"#334455", flexWrap:"wrap", justifyContent:"center" }}>
