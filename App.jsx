@@ -331,6 +331,7 @@ export default function App() {
     const tx = t => PL + ((t - timeStart) / timeRange) * CW;
     const ty = p => PT + CH - ((p - minP) / pRange) * CH;
     const nowX = tx(now);
+    const totalView = xViewMin.current + TRAJ_MIN; // total visible minutes
 
     // Grid
     ctx.lineWidth = 1;
@@ -437,7 +438,6 @@ export default function App() {
 
     // X labels — dynamic interval based on view window
     ctx.textAlign = "center";
-    const totalView = xViewMin.current + TRAJ_MIN;
     const step = totalView <= 30 ? 2 : totalView <= 120 ? 10 : totalView <= 360 ? 30 : 60;
     const startM = -Math.ceil(xViewMin.current / step) * step;
     for (let m = startM; m <= TRAJ_MIN; m += step) {
