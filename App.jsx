@@ -108,14 +108,10 @@ export default function App() {
   const yZoom       = useRef(1);
   const isDraggingY = useRef(false);
   const dragStartY  = useRef(0);
-  const dragStartZ  = useRef(1);
-
   // ── X-axis zoom (horizontal) ───────────────────────────────
-  // viewMinutes: how many minutes to show looking back from now
-  const xViewMin    = useRef(60);   // default: show last 60 min
+  const xViewMin    = useRef(60);
   const isDraggingX = useRef(false);
   const dragStartX2 = useRef(0);
-  const dragStartXV = useRef(60);
 
   const autoFollow  = useRef(true);   // true = chart follows current price
   const [showFollow, setShowFollow] = useState(false); // show "back to now" button
@@ -196,6 +192,14 @@ export default function App() {
       const now = Date.now();
       priceHist.current.push({ time: now, price });
       priceHist.current = priceHist.current.filter(p => now - p.time < HIST_MIN * 60000);
+      // Generate first trajectory immediately on first price
+      if (curTrajs.current.length === 0) {
+        const imb = calcImbalance(priceHist.current);
+        const pts = calcTrajectory(price, imb, now);
+        const min = Math.floor(now / 60000);
+        lastMin.current = min;
+        curTrajs.current.push({ t0: now, pts });
+      }
       setInfo(d2 => ({ ...d2, price, change24h }));
     };
     ws.onerror = () => setInfo(d => ({ ...d, error: "خطأ في الاتصال" }));
@@ -258,16 +262,17 @@ export default function App() {
     const onMouseDown = (e) => {
       if (!isOnYAxis(e.clientX)) return;
       isDraggingY.current = true;
-      dragStartY.current  = e.clientY;
-      dragStartZ.current  = yZoom.current;
+      dragStartY.current  = e.clientY;  // track LAST Y for delta
       e.preventDefault();
       e.stopPropagation();
     };
     const onMouseMove = (e) => {
       if (!isDraggingY.current) return;
       e.preventDefault();
-      const dy = dragStartY.current - e.clientY;
-      yZoom.current = Math.max(0.1, Math.min(10, dragStartZ.current * (1 + dy / 200)));
+      const dy = dragStartY.current - e.clientY; // pixels moved since last event
+      const sensitivity = 0.005; // smooth: 1px = 0.5% zoom change
+      yZoom.current = Math.max(0.05, Math.min(20, yZoom.current * (1 + dy * sensitivity)));
+      dragStartY.current = e.clientY; // update last position
     };
     const onMouseUp = () => { isDraggingY.current = false; };
 
@@ -278,14 +283,14 @@ export default function App() {
       if (!isOnYAxis(t.clientX)) return;
       isDraggingY.current = true;
       dragStartY.current  = t.clientY;
-      dragStartZ.current  = yZoom.current;
-    };
+        };
     const onTouchMove = (e) => {
       if ((!isDraggingY.current && !isDraggingX.current) || e.touches.length !== 1) return;
-      e.preventDefault(); // stop page scroll while dragging
+      e.preventDefault();
       if (isDraggingY.current) {
         const dy = dragStartY.current - e.touches[0].clientY;
-        yZoom.current = Math.max(0.1, Math.min(10, dragStartZ.current * (1 + dy / 200)));
+        yZoom.current = Math.max(0.05, Math.min(20, yZoom.current * (1 + dy * 0.005)));
+        dragStartY.current = e.touches[0].clientY;
       }
     };
     const onTouchEnd = () => { isDraggingY.current = false; };
@@ -313,16 +318,17 @@ export default function App() {
       if (e.button !== 0 || !isOnChart(e.clientX)) return;
       isDraggingX.current  = true;
       dragStartX2.current  = e.clientX;
-      dragStartXV.current  = xViewMin.current;
-      e.preventDefault();
+          e.preventDefault();
       e.stopPropagation();
     };
     const onMouseMoveX = (e) => {
       if (!isDraggingX.current) return;
       e.preventDefault();
-      const dx = e.clientX - dragStartX2.current;
-      const factor = 1 - dx / 400;
-      xViewMin.current = Math.max(5, Math.min(1440, dragStartXV.current * factor));
+      const dx = e.clientX - dragStartX2.current; // delta since last event
+      const sensitivity = 0.008;
+      // drag right = zoom out (more time), drag left = zoom in (less time)
+      xViewMin.current = Math.max(5, Math.min(1440, xViewMin.current * (1 + dx * sensitivity)));
+      dragStartX2.current = e.clientX; // update last position
       autoFollow.current = false;
       setShowFollow(true);
     };
@@ -471,9 +477,11 @@ export default function App() {
       latest.pts.forEach(p => { const x = tx(p.time), y = ty(p.price); s ? ctx.lineTo(x, y) : (ctx.moveTo(x, y), s = true); });
       ctx.stroke(); ctx.shadowBlur = 0;
       const ep = latest.pts.at(-1);
-      ctx.fillStyle = `rgba(${cv},0.75)`; ctx.beginPath(); ctx.arc(tx(ep.time), ty(ep.price), 3, 0, Math.PI * 2); ctx.fill();
+      const epX = Math.min(tx(ep.time), PL + CW - 60); // clamp inside canvas
+      const epY = ty(ep.price);
+      ctx.fillStyle = `rgba(${cv},0.75)`; ctx.beginPath(); ctx.arc(tx(ep.time), epY, 3, 0, Math.PI * 2); ctx.fill();
       ctx.font = "10px 'Courier New'"; ctx.fillStyle = `rgba(${cv},0.9)`; ctx.textAlign = "left";
-      ctx.fillText(`$${ep.price.toLocaleString("en",{maximumFractionDigits:0})}`, tx(ep.time) + 6, ty(ep.price) + 4);
+      ctx.fillText(`$${ep.price.toLocaleString("en",{maximumFractionDigits:0})}`, epX + 6, epY + 4);
     }
 
     // Price history
@@ -610,14 +618,14 @@ export default function App() {
         سحب على أرقام السعر (يسار): تكبير/تصغير السعر · سحب على الرسم: تكبير/تصغير الوقت · دبل كليك: إعادة
       </div>
 
-      <div style={{ display:"flex", gap:18, fontSize:10, color:"#334455", flexWrap:"wrap", justifyContent:"center" }}>
-        {[["#c0d8ff","السعر الفعلي"],["#00ff88","توقع صعود"],["#ff4466","توقع هبوط"],["rgba(80,140,255,0.55)","سحابة الدقيقة السابقة"]].map(([c,l])=>(
-          <span key={l}><span style={{color:c,marginLeft:4}}>─</span>{l}</span>
+      <div style={{ display:"flex", gap:16, fontSize:10, color:"#445566", flexWrap:"wrap", justifyContent:"center" }}>
+        {[["#c0d8ff","السعر"],["#00ff88","توقع ↑"],["#ff4466","توقع ↓"],["rgba(80,140,255,0.7)","سحابة"]].map(([c,l])=>(
+          <span key={l} style={{display:"flex",alignItems:"center",gap:4}}>
+            <span style={{color:c,fontSize:14}}>─</span>
+            <span>{l}</span>
+          </span>
         ))}
-      </div>
-
-      <div style={{ fontSize:9, color:"#111d2a" }}>
-        Binance WebSocket · Supabase · مجاني 100% · يحفظ السجل ويستعيده · سجل 24 ساعة
+        <span style={{color:"#223344",marginRight:8}}>· سحب Y: زوم السعر · سحب X: زوم الوقت · دبل كليك: إعادة</span>
       </div>
 
       <style>{`@keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}`}</style>
