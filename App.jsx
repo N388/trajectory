@@ -74,6 +74,11 @@ export default function App() {
   const wsTickRef  = useRef(null);
   const wsDepthRef = useRef(null);
   const livePrice  = useRef(null);
+  // ── Y-axis zoom (TradingView style) ──────────────────────
+  const yZoom       = useRef(1);
+  const isDraggingY = useRef(false);
+  const dragStartY  = useRef(0);
+  const dragStartZ  = useRef(1);
 
   const [info, setInfo] = useState({
     price: null, change24h: 0, bidPct: 50, askPct: 50,
@@ -173,6 +178,74 @@ export default function App() {
     canvas.height = rect.height * dpr.current;
   }, []);
 
+  // ── Y-axis drag zoom (TradingView style) ────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const PL = 74;
+
+    const isOnYAxis = (clientX) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = (clientX - rect.left) * (canvas.width / rect.width) / (dpr.current || 1);
+      return x < PL;
+    };
+
+    const onMouseDown = (e) => {
+      if (!isOnYAxis(e.clientX)) return;
+      isDraggingY.current = true;
+      dragStartY.current  = e.clientY;
+      dragStartZ.current  = yZoom.current;
+      e.preventDefault();
+    };
+    const onMouseMove = (e) => {
+      if (!isDraggingY.current) return;
+      const dy = dragStartY.current - e.clientY; // up = zoom in
+      yZoom.current = Math.max(0.1, Math.min(10, dragStartZ.current * (1 + dy / 200)));
+    };
+    const onMouseUp = () => { isDraggingY.current = false; };
+
+    // Touch support
+    const onTouchStart = (e) => {
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      if (!isOnYAxis(t.clientX)) return;
+      isDraggingY.current = true;
+      dragStartY.current  = t.clientY;
+      dragStartZ.current  = yZoom.current;
+    };
+    const onTouchMove = (e) => {
+      if (!isDraggingY.current || e.touches.length !== 1) return;
+      const dy = dragStartY.current - e.touches[0].clientY;
+      yZoom.current = Math.max(0.1, Math.min(10, dragStartZ.current * (1 + dy / 200)));
+    };
+    const onTouchEnd = () => { isDraggingY.current = false; };
+
+    // Double-click Y axis = reset zoom
+    const onDblClick = (e) => {
+      if (!isOnYAxis(e.clientX)) return;
+      yZoom.current = 1;
+    };
+
+    canvas.addEventListener("mousedown",  onMouseDown);
+    window.addEventListener("mousemove",  onMouseMove);
+    window.addEventListener("mouseup",    onMouseUp);
+    canvas.addEventListener("touchstart", onTouchStart, { passive: true });
+    window.addEventListener("touchmove",  onTouchMove,  { passive: true });
+    window.addEventListener("touchend",   onTouchEnd);
+    canvas.addEventListener("dblclick",   onDblClick);
+
+    return () => {
+      canvas.removeEventListener("mousedown",  onMouseDown);
+      window.removeEventListener("mousemove",  onMouseMove);
+      window.removeEventListener("mouseup",    onMouseUp);
+      canvas.removeEventListener("touchstart", onTouchStart);
+      window.removeEventListener("touchmove",  onTouchMove);
+      window.removeEventListener("touchend",   onTouchEnd);
+      canvas.removeEventListener("dblclick",   onDblClick);
+    };
+  }, []);
+
+
   // ── Draw ────────────────────────────────────────────────
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -212,8 +285,11 @@ export default function App() {
     }
 
     const rawMin = Math.min(...allP), rawMax = Math.max(...allP);
-    const pad  = Math.max((rawMax - rawMin) * 0.15, rawMin * 0.001);
-    const minP = rawMin - pad, maxP = rawMax + pad, pRange = maxP - minP;
+    const mid  = (rawMin + rawMax) / 2;
+    const halfRange = Math.max((rawMax - rawMin) * 0.15, rawMin * 0.001) + (rawMax - rawMin) / 2;
+    // yZoom: >1 = zoom out (more range), <1 = zoom in (less range)
+    const zoomedHalf = halfRange / yZoom.current;
+    const minP = mid - zoomedHalf, maxP = mid + zoomedHalf, pRange = maxP - minP;
     const tx = t => PL + ((t - timeStart) / timeRange) * CW;
     const ty = p => PT + CH - ((p - minP) / pRange) * CH;
     const nowX = tx(now);
@@ -383,7 +459,10 @@ export default function App() {
         </div>
       </div>
 
-      <canvas ref={canvasRef} style={{ width:"100%", maxWidth:880, height:460, borderRadius:8, border:"1px solid rgba(255,255,255,0.04)", display:"block" }} />
+      <canvas ref={canvasRef} style={{ width:"100%", maxWidth:880, height:460, borderRadius:8, border:"1px solid rgba(255,255,255,0.04)", display:"block", cursor:"crosshair" }} />
+      <div style={{ fontSize:9, color:"#1a2a3a", textAlign:"center" }}>
+        اسحبي على محور السعر (يسار) للتكبير والتصغير · دابل كليك للإعادة
+      </div>
 
       <div style={{ display:"flex", gap:18, fontSize:10, color:"#334455", flexWrap:"wrap", justifyContent:"center" }}>
         {[["#c0d8ff","السعر الفعلي"],["#00ff88","توقع صعود"],["#ff4466","توقع هبوط"],["rgba(80,140,255,0.55)","سحابة الدقيقة السابقة"]].map(([c,l])=>(
