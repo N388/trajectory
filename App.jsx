@@ -19,20 +19,28 @@ const SAVE_MS   = 10000; // save to Supabase every 10s
 const safeNum = (v, fb = 0) => { const n = Number(v); return isFinite(n) ? n : fb; };
 
 function calcTrajectory(price, imb, startTime) {
-  const endPrice = price * (1 + imb * 0.005);
+  const endPrice = price * (1 + imb * 0.008);
   return Array.from({ length: TRAJ_PTS + 1 }, (_, i) => {
     const t    = i / TRAJ_PTS;
     const ease = t * t * (3 - 2 * t);
     const base = price + (endPrice - price) * ease;
-    const wave = Math.sin(t * Math.PI * 2.5) * Math.abs(imb) * price * 0.00022 * (1 - t * 0.6);
+    const wave = Math.sin(t * Math.PI * 3) * Math.abs(imb) * price * 0.0004 * (1 - t * 0.7);
     return { time: startTime + t * TRAJ_MIN * 60000, price: base + wave };
   });
 }
 
 function calcImbalance(hist) {
   if (hist.length < 2) return 0;
-  const slice = hist.slice(-Math.min(hist.length, 5));
-  const pct   = (slice.at(-1).price - slice[0].price) / slice[0].price;
+  const now = Date.now();
+  // Use last 60 seconds of data for more stable imbalance
+  const recent = hist.filter(p => now - p.time < 60000);
+  if (recent.length < 2) {
+    // Fallback to last 10 points
+    const slice = hist.slice(-Math.min(hist.length, 10));
+    const pct = (slice.at(-1).price - slice[0].price) / slice[0].price;
+    return Math.max(-1, Math.min(1, pct / 0.003));
+  }
+  const pct = (recent.at(-1).price - recent[0].price) / recent[0].price;
   return Math.max(-1, Math.min(1, pct / 0.003));
 }
 
@@ -112,6 +120,12 @@ export default function App() {
   const xViewMin    = useRef(60);
   const isDraggingX = useRef(false);
   const dragStartX2 = useRef(0);
+  const dragStartY2 = useRef(0);
+  // ── Pan offsets ────────────────────────────────────────────
+  const xPanOffset  = useRef(0);     // horizontal pan offset in ms
+  const yPanOffset  = useRef(0);     // vertical pan offset in price units
+  // ── Crosshair ─────────────────────────────────────────────
+  const mousePos    = useRef(null);  // {clientX, clientY} for crosshair
 
   const autoFollow  = useRef(true);   // true = chart follows current price
   const [showFollow, setShowFollow] = useState(false); // show "back to now" button
@@ -123,8 +137,37 @@ export default function App() {
     accAll: null,  // accuracy all time
   });
 
+  // ── localStorage persistence ────────────────────────────
+  const STORAGE_KEY = "btc_chart_state";
+  const saveChartState = useCallback(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        xViewMin: xViewMin.current,
+        yZoom: yZoom.current,
+        xPanOffset: xPanOffset.current,
+        yPanOffset: yPanOffset.current,
+        autoFollow: autoFollow.current,
+      }));
+    } catch (_) {}
+  }, []);
+
   // ── Load history + accuracy from Supabase on mount ────────
   useEffect(() => {
+    // Restore chart state from localStorage
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+      if (saved) {
+        if (isFinite(saved.xViewMin))    xViewMin.current   = saved.xViewMin;
+        if (isFinite(saved.yZoom))       yZoom.current      = saved.yZoom;
+        if (isFinite(saved.xPanOffset))  xPanOffset.current = saved.xPanOffset;
+        if (isFinite(saved.yPanOffset))  yPanOffset.current = saved.yPanOffset;
+        if (typeof saved.autoFollow === "boolean") {
+          autoFollow.current = saved.autoFollow;
+          if (!saved.autoFollow) setShowFollow(true);
+        }
+      }
+    } catch (_) {}
+
     Promise.all([
       sbLoadHistory(),
       sbCalcAccuracy(60),
@@ -138,6 +181,13 @@ export default function App() {
       }
     });
   }, []);
+
+  // Save state on page unload
+  useEffect(() => {
+    const onUnload = () => saveChartState();
+    window.addEventListener("beforeunload", onUnload);
+    return () => window.removeEventListener("beforeunload", onUnload);
+  }, [saveChartState]);
 
   // Refresh accuracy every 5 minutes
   useEffect(() => {
@@ -247,117 +297,239 @@ export default function App() {
     return () => { window.removeEventListener("resize", resizeCanvas); clearTimeout(t); };
   }, []);
 
-  // ── Y-axis drag zoom (TradingView style) ────────────────
+  // ── Interaction: Pan, Zoom, Crosshair (TradingView style) ─
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const PL = 74;
+    const PL = 74, PR = 14, PT = 20, PB = 38;
 
-    const isOnYAxis = (clientX) => {
+    const getCanvasXY = (clientX, clientY) => {
       const rect = canvas.getBoundingClientRect();
       const x = (clientX - rect.left) * (canvas.width / rect.width) / (dpr.current || 1);
-      return x < PL;
+      const y = (clientY - rect.top) * (canvas.height / rect.height) / (dpr.current || 1);
+      return { x, y };
     };
+    const isOnYAxis = (clientX) => getCanvasXY(clientX, 0).x < PL;
+    const isOnChart = (clientX) => getCanvasXY(clientX, 0).x >= PL;
 
+    // ── Y-axis drag = zoom Y ──
     const onMouseDown = (e) => {
       if (!isOnYAxis(e.clientX)) return;
       isDraggingY.current = true;
-      dragStartY.current  = e.clientY;  // track LAST Y for delta
+      dragStartY.current  = e.clientY;
       e.preventDefault();
       e.stopPropagation();
     };
-    const onMouseMove = (e) => {
+    const onMouseMoveY = (e) => {
       if (!isDraggingY.current) return;
       e.preventDefault();
-      const dy = dragStartY.current - e.clientY; // pixels moved since last event
-      const sensitivity = 0.005; // smooth: 1px = 0.5% zoom change
-      yZoom.current = Math.max(0.05, Math.min(20, yZoom.current * (1 + dy * sensitivity)));
-      dragStartY.current = e.clientY; // update last position
+      const dy = dragStartY.current - e.clientY;
+      yZoom.current = Math.max(0.05, Math.min(20, yZoom.current * (1 + dy * 0.005)));
+      dragStartY.current = e.clientY;
+      saveChartState();
     };
-    const onMouseUp = () => { isDraggingY.current = false; };
+    const onMouseUpY = () => { isDraggingY.current = false; };
 
-    // Touch support
-    const onTouchStart = (e) => {
-      if (e.touches.length !== 1) return;
-      const t = e.touches[0];
-      if (!isOnYAxis(t.clientX)) return;
-      isDraggingY.current = true;
-      dragStartY.current  = t.clientY;
-        };
-    const onTouchMove = (e) => {
-      if ((!isDraggingY.current && !isDraggingX.current) || e.touches.length !== 1) return;
-      e.preventDefault();
-      if (isDraggingY.current) {
-        const dy = dragStartY.current - e.touches[0].clientY;
-        yZoom.current = Math.max(0.05, Math.min(20, yZoom.current * (1 + dy * 0.005)));
-        dragStartY.current = e.touches[0].clientY;
-      }
-    };
-    const onTouchEnd = () => { isDraggingY.current = false; };
-
-    // Double-click Y axis = reset zoom
-    const onDblClick = (e) => {
-      const rect = canvas.getBoundingClientRect();
-      const x = (e.clientX - rect.left) * (canvas.width / rect.width) / (dpr.current || 1);
-      if (x < PL) {
-        yZoom.current = 1;
-      } else {
-        xViewMin.current = 60;
-        autoFollow.current = true;
-        setShowFollow(false);
-      }
-    };
-
-    // X-axis drag: drag left/right on chart area to zoom time window
-    const isOnChart = (clientX) => {
-      const rect = canvas.getBoundingClientRect();
-      const x = (clientX - rect.left) * (canvas.width / rect.width) / (dpr.current || 1);
-      return x >= PL;
-    };
+    // ── Chart area drag = pan (X + Y) ──
     const onMouseDownX = (e) => {
       if (e.button !== 0 || !isOnChart(e.clientX)) return;
       isDraggingX.current  = true;
       dragStartX2.current  = e.clientX;
-          e.preventDefault();
+      dragStartY2.current  = e.clientY;
+      e.preventDefault();
       e.stopPropagation();
     };
     const onMouseMoveX = (e) => {
       if (!isDraggingX.current) return;
       e.preventDefault();
-      const dx = e.clientX - dragStartX2.current; // delta since last event
-      const sensitivity = 0.008;
-      // drag right = zoom out (more time), drag left = zoom in (less time)
-      xViewMin.current = Math.max(5, Math.min(1440, xViewMin.current * (1 + dx * sensitivity)));
-      dragStartX2.current = e.clientX; // update last position
+      const dx = e.clientX - dragStartX2.current;
+      const dy = e.clientY - dragStartY2.current;
+      const rect = canvas.getBoundingClientRect();
+      const CW = rect.width - PL - PR;
+      const CH = rect.height - PT - PB;
+      const totalTimeMs = (xViewMin.current + TRAJ_MIN) * 60000;
+      // Pan X: convert pixel delta to time delta
+      xPanOffset.current -= (dx / CW) * totalTimeMs;
+      // Pan Y: convert pixel delta to price delta (need current pRange)
+      // We approximate pRange from current zoom state
+      const allP = [
+        ...priceHist.current.map(p => p.price),
+        ...curTrajs.current.flatMap(t => t.pts.map(p => p.price)),
+      ];
+      if (allP.length > 0) {
+        const rawMin = Math.min(...allP), rawMax = Math.max(...allP);
+        const halfRange = Math.max((rawMax - rawMin) * 0.15, rawMin * 0.001) + (rawMax - rawMin) / 2;
+        const zoomedHalf = halfRange / yZoom.current;
+        const pRange = zoomedHalf * 2;
+        yPanOffset.current += (dy / CH) * pRange;
+      }
+      dragStartX2.current = e.clientX;
+      dragStartY2.current = e.clientY;
       autoFollow.current = false;
       setShowFollow(true);
+      saveChartState();
     };
     const onMouseUpX = () => { isDraggingX.current = false; };
 
+    // ── Wheel = zoom toward cursor ──
+    const onWheel = (e) => {
+      e.preventDefault();
+      const { x, y } = getCanvasXY(e.clientX, e.clientY);
+      const rect = canvas.getBoundingClientRect();
+      const W = rect.width, H = rect.height;
+      const CW = W - PL - PR, CH = H - PT - PB;
+      // Zoom factor: scroll up = zoom in (negative deltaY), scroll down = zoom out
+      const zoomFactor = 1 + e.deltaY * 0.001;
+      // Where is the cursor in the chart (0..1)?
+      const chartXRatio = Math.max(0, Math.min(1, (x - PL) / CW));
+      const chartYRatio = Math.max(0, Math.min(1, (y - PT) / CH));
+      // Zoom X (time)
+      const oldXViewMin = xViewMin.current;
+      xViewMin.current = Math.max(2, Math.min(1440, xViewMin.current * zoomFactor));
+      // Adjust pan so the point under cursor stays fixed
+      const totalOld = (oldXViewMin + TRAJ_MIN) * 60000;
+      const totalNew = (xViewMin.current + TRAJ_MIN) * 60000;
+      // The cursor time = timeEnd + xPanOffset - (1 - chartXRatio) * totalOld
+      // After zoom, we want the same time under cursor:
+      // xPanOffset_new = xPanOffset + (1 - chartXRatio) * (totalNew - totalOld)
+      xPanOffset.current += (1 - chartXRatio) * (totalNew - totalOld);
+      // Zoom Y (price)
+      const oldYZoom = yZoom.current;
+      yZoom.current = Math.max(0.05, Math.min(20, yZoom.current / zoomFactor));
+      // Adjust yPanOffset so price under cursor stays fixed
+      // The cursor is at chartYRatio from top. Price at cursor:
+      // p = maxP - chartYRatio * pRange
+      // After zoom change, we need to adjust yPanOffset to keep this price at same Y
+      const allP = [
+        ...priceHist.current.map(p => p.price),
+        ...curTrajs.current.flatMap(t => t.pts.map(p => p.price)),
+      ];
+      if (allP.length > 0) {
+        const rawMin = Math.min(...allP), rawMax = Math.max(...allP);
+        const mid = (rawMin + rawMax) / 2;
+        const halfRangeBase = Math.max((rawMax - rawMin) * 0.15, rawMin * 0.001) + (rawMax - rawMin) / 2;
+        const oldHalf = halfRangeBase / oldYZoom;
+        const newHalf = halfRangeBase / yZoom.current;
+        const oldMid = mid + yPanOffset.current;
+        // Price at cursor with old zoom: oldMid + oldHalf - chartYRatio * 2 * oldHalf
+        const priceAtCursor = oldMid + oldHalf * (1 - 2 * chartYRatio);
+        // With new zoom, we want same price at same Y:
+        // newMid + newHalf * (1 - 2*chartYRatio) = priceAtCursor
+        // newMid = priceAtCursor - newHalf*(1 - 2*chartYRatio)
+        // yPanOffset_new = newMid - mid = priceAtCursor - newHalf*(1 - 2*chartYRatio) - mid
+        yPanOffset.current = priceAtCursor - newHalf * (1 - 2 * chartYRatio) - mid;
+      }
+      if (!autoFollow.current || Math.abs(xPanOffset.current) > 1000) {
+        autoFollow.current = false;
+        setShowFollow(true);
+      }
+      saveChartState();
+    };
+
+    // ── Touch support ──
+    const onTouchStart = (e) => {
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      if (isOnYAxis(t.clientX)) {
+        isDraggingY.current = true;
+        dragStartY.current  = t.clientY;
+      } else {
+        isDraggingX.current  = true;
+        dragStartX2.current  = t.clientX;
+        dragStartY2.current  = t.clientY;
+      }
+    };
+    const onTouchMove = (e) => {
+      if (e.touches.length !== 1) return;
+      e.preventDefault();
+      const t = e.touches[0];
+      if (isDraggingY.current) {
+        const dy = dragStartY.current - t.clientY;
+        yZoom.current = Math.max(0.05, Math.min(20, yZoom.current * (1 + dy * 0.005)));
+        dragStartY.current = t.clientY;
+      }
+      if (isDraggingX.current) {
+        const dx = t.clientX - dragStartX2.current;
+        const dy = t.clientY - dragStartY2.current;
+        const rect = canvas.getBoundingClientRect();
+        const CW = rect.width - PL - PR;
+        const CH = rect.height - PT - PB;
+        const totalTimeMs = (xViewMin.current + TRAJ_MIN) * 60000;
+        xPanOffset.current -= (dx / CW) * totalTimeMs;
+        const allP = priceHist.current.map(p => p.price);
+        if (allP.length > 0) {
+          const rawMin = Math.min(...allP), rawMax = Math.max(...allP);
+          const halfRange = Math.max((rawMax - rawMin) * 0.15, rawMin * 0.001) + (rawMax - rawMin) / 2;
+          const pRange = (halfRange / yZoom.current) * 2;
+          yPanOffset.current += (dy / CH) * pRange;
+        }
+        dragStartX2.current = t.clientX;
+        dragStartY2.current = t.clientY;
+        autoFollow.current = false;
+        setShowFollow(true);
+      }
+      saveChartState();
+    };
+    const onTouchEnd = () => { isDraggingY.current = false; isDraggingX.current = false; };
+
+    // ── Double-click = reset ──
+    const onDblClick = (e) => {
+      if (isOnYAxis(e.clientX)) {
+        yZoom.current = 1;
+        yPanOffset.current = 0;
+      } else {
+        xViewMin.current = 60;
+        xPanOffset.current = 0;
+        yPanOffset.current = 0;
+        yZoom.current = 1;
+        autoFollow.current = true;
+        setShowFollow(false);
+      }
+      saveChartState();
+    };
+
+    // ── Crosshair tracking ──
+    const onMouseMoveCrosshair = (e) => {
+      if (isDraggingY.current || isDraggingX.current) return;
+      const { x, y } = getCanvasXY(e.clientX, e.clientY);
+      if (x >= PL && x <= PL + (canvas.width / (dpr.current||1)) - PL - PR && y >= PT && y <= PT + (canvas.height / (dpr.current||1)) - PT - PB) {
+        mousePos.current = { x, y };
+      } else {
+        mousePos.current = null;
+      }
+    };
+    const onMouseLeave = () => { mousePos.current = null; };
+
     canvas.addEventListener("mousedown",  onMouseDown);
     canvas.addEventListener("mousedown",  onMouseDownX);
-    window.addEventListener("mousemove",  onMouseMove);
+    window.addEventListener("mousemove",  onMouseMoveY);
     window.addEventListener("mousemove",  onMouseMoveX);
-    window.addEventListener("mouseup",    onMouseUp);
+    window.addEventListener("mousemove",  onMouseMoveCrosshair);
+    window.addEventListener("mouseup",    onMouseUpY);
     window.addEventListener("mouseup",    onMouseUpX);
+    canvas.addEventListener("wheel",      onWheel, { passive: false });
     canvas.addEventListener("touchstart", onTouchStart, { passive: false });
     window.addEventListener("touchmove",  onTouchMove,  { passive: false });
     window.addEventListener("touchend",   onTouchEnd);
     canvas.addEventListener("dblclick",   onDblClick);
+    canvas.addEventListener("mouseleave", onMouseLeave);
 
     return () => {
       canvas.removeEventListener("mousedown",  onMouseDown);
       canvas.removeEventListener("mousedown",  onMouseDownX);
-      window.removeEventListener("mousemove",  onMouseMove);
+      window.removeEventListener("mousemove",  onMouseMoveY);
       window.removeEventListener("mousemove",  onMouseMoveX);
-      window.removeEventListener("mouseup",    onMouseUp);
+      window.removeEventListener("mousemove",  onMouseMoveCrosshair);
+      window.removeEventListener("mouseup",    onMouseUpY);
       window.removeEventListener("mouseup",    onMouseUpX);
+      canvas.removeEventListener("wheel",      onWheel);
       canvas.removeEventListener("touchstart", onTouchStart);
       window.removeEventListener("touchmove",  onTouchMove);
       window.removeEventListener("touchend",   onTouchEnd);
       canvas.removeEventListener("dblclick",   onDblClick);
+      canvas.removeEventListener("mouseleave", onMouseLeave);
     };
-  }, []);
+  }, [saveChartState]);
 
 
   // ── Draw ────────────────────────────────────────────────
@@ -376,8 +548,10 @@ export default function App() {
 
     const PL = 74, PR = 14, PT = 20, PB = 38;
     const CW = W - PL - PR, CH = H - PT - PB;
-    const timeStart = now - xViewMin.current * 60000;
-    const timeEnd   = now + TRAJ_MIN * 60000;
+    // Apply pan offset: when autoFollow, ignore xPanOffset
+    const panX = autoFollow.current ? 0 : xPanOffset.current;
+    const timeEnd   = now + TRAJ_MIN * 60000 - panX;
+    const timeStart = timeEnd - (xViewMin.current + TRAJ_MIN) * 60000;
     const timeRange = timeEnd - timeStart;
 
     const allP = [
@@ -399,7 +573,7 @@ export default function App() {
     }
 
     const rawMin = Math.min(...allP), rawMax = Math.max(...allP);
-    const mid  = (rawMin + rawMax) / 2;
+    const mid  = (rawMin + rawMax) / 2 + yPanOffset.current;
     const halfRange = Math.max((rawMax - rawMin) * 0.15, rawMin * 0.001) + (rawMax - rawMin) / 2;
     // yZoom: >1 = zoom out (more range), <1 = zoom in (less range)
     const zoomedHalf = halfRange / yZoom.current;
@@ -409,23 +583,24 @@ export default function App() {
     const nowX = tx(now);
     const totalView = xViewMin.current + TRAJ_MIN; // total visible minutes
 
-    // Grid
+    // Grid — iterate over visible time range
     ctx.lineWidth = 1;
     const gridStep = totalView <= 30 ? 2 : totalView <= 120 ? 10 : totalView <= 360 ? 30 : 60;
-    for (let m = -Math.ceil(xViewMin.current / gridStep) * gridStep; m <= TRAJ_MIN; m += gridStep) {
-      const x = tx(now + m * 60000);
-      if (x < PL - 1 || x > PL + CW + 1) continue;
-      ctx.strokeStyle = "rgba(255,255,255,0.024)";
-      ctx.beginPath(); ctx.moveTo(x, PT); ctx.lineTo(x, PT + CH); ctx.stroke();
+    const gridStepMs = gridStep * 60000;
+    {
+      const firstGrid = Math.floor(timeStart / gridStepMs) * gridStepMs;
+      for (let t = firstGrid; t <= timeEnd; t += gridStepMs) {
+        const x = tx(t);
+        if (x < PL - 1 || x > PL + CW + 1) continue;
+        ctx.strokeStyle = "rgba(255,255,255,0.024)";
+        ctx.beginPath(); ctx.moveTo(x, PT); ctx.lineTo(x, PT + CH); ctx.stroke();
+      }
     }
-    for (let i = 0; i <= 6; i++) {
-      const y = PT + (i / 6) * CH;
-      ctx.strokeStyle = "rgba(255,255,255,0.024)";
-      ctx.beginPath(); ctx.moveTo(PL, y); ctx.lineTo(PL + CW, y); ctx.stroke();
-    }
+    // Y grid lines are drawn with Y labels below
 
     ctx.fillStyle = "rgba(0,0,0,0.14)";
-    ctx.fillRect(PL, PT, Math.max(0, nowX - PL), CH);
+    const clampedNowX = Math.max(PL, Math.min(PL + CW, nowX));
+    ctx.fillRect(PL, PT, Math.max(0, clampedNowX - PL), CH);
 
     ctx.setLineDash([3, 5]); ctx.strokeStyle = "rgba(80,150,255,0.18)"; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(nowX, PT); ctx.lineTo(nowX, PT + CH); ctx.stroke();
@@ -507,34 +682,93 @@ export default function App() {
       ctx.fillText(`$${cp.toLocaleString("en")}`, nowX + 10, cy - 7);
     }
 
-    // Y labels
+    // Y labels — nice intervals that move with pan/zoom (like X-axis)
     ctx.font = "10px 'Courier New'"; ctx.fillStyle = "rgba(65,95,135,0.75)"; ctx.textAlign = "right";
-    for (let i = 0; i <= 5; i++) {
-      const p = minP + ((5 - i) / 5) * pRange;
-      ctx.fillText(`$${safeNum(p).toFixed(0)}`, PL - 6, PT + (i / 5) * CH + 3);
+    {
+      // Calculate a "nice" step for price labels
+      const targetLabels = 6;
+      const rawStep = pRange / targetLabels;
+      const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+      const niceSteps = [1, 2, 5, 10, 20, 50];
+      let priceStep = mag;
+      for (const ns of niceSteps) {
+        if (mag * ns >= rawStep) { priceStep = mag * ns; break; }
+      }
+      const startP = Math.ceil(minP / priceStep) * priceStep;
+      for (let p = startP; p <= maxP; p += priceStep) {
+        const y = ty(p);
+        if (y < PT - 5 || y > PT + CH + 5) continue;
+        ctx.fillText(`$${safeNum(p).toLocaleString("en", {maximumFractionDigits: 0})}`, PL - 6, y + 3);
+        // Draw grid line at this price
+        ctx.strokeStyle = "rgba(255,255,255,0.024)";
+        ctx.beginPath(); ctx.moveTo(PL, y); ctx.lineTo(PL + CW, y); ctx.stroke();
+      }
     }
 
-    // X labels — dynamic interval based on view window
+    // X labels — iterate over visible time range with nice intervals
     ctx.textAlign = "center";
     const step = totalView <= 30 ? 2 : totalView <= 120 ? 10 : totalView <= 360 ? 30 : 60;
-    const startM = -Math.ceil(xViewMin.current / step) * step;
-    for (let m = startM; m <= TRAJ_MIN; m += step) {
-      const x = tx(now + m * 60000);
-      if (x < PL || x > PL + CW) continue;
-      const isNow = m === 0;
-      ctx.fillStyle = isNow ? "rgba(100,175,255,0.95)" : "rgba(65,95,135,0.65)";
-      ctx.font = isNow ? "bold 10px 'Courier New'" : "10px 'Courier New'";
-      let label;
-      if (isNow) {
-        label = "الآن";
-      } else if (Math.abs(m) >= 60) {
-        const h = Math.floor(Math.abs(m) / 60);
-        const min2 = Math.abs(m) % 60;
-        label = `${m < 0 ? "-" : "+"}${h}س${min2 > 0 ? min2 + "د" : ""}`;
-      } else {
-        label = `${m > 0 ? "+" : ""}${m}د`;
+    const stepMs = step * 60000;
+    {
+      const firstLabel = Math.floor(timeStart / stepMs) * stepMs;
+      for (let t = firstLabel; t <= timeEnd; t += stepMs) {
+        const x = tx(t);
+        if (x < PL || x > PL + CW) continue;
+        const m = (t - now) / 60000; // minutes from now
+        const isNow = Math.abs(m) < step * 0.3;
+        ctx.fillStyle = isNow ? "rgba(100,175,255,0.95)" : "rgba(65,95,135,0.65)";
+        ctx.font = isNow ? "bold 10px 'Courier New'" : "10px 'Courier New'";
+        let label;
+        if (isNow) {
+          label = "الآن";
+        } else if (Math.abs(m) >= 60) {
+          const h = Math.floor(Math.abs(m) / 60);
+          const min2 = Math.round(Math.abs(m) % 60);
+          label = `${m < 0 ? "-" : "+"}${h}س${min2 > 0 ? min2 + "د" : ""}`;
+        } else {
+          label = `${m > 0 ? "+" : ""}${Math.round(m)}د`;
+        }
+        ctx.fillText(label, x, PT + CH + 22);
       }
-      ctx.fillText(label, x, PT + CH + 22);
+    }
+
+    // ── Crosshair indicator ──
+    if (mousePos.current) {
+      const mx = mousePos.current.x, my = mousePos.current.y;
+      if (mx >= PL && mx <= PL + CW && my >= PT && my <= PT + CH) {
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = "rgba(120,170,230,0.35)";
+        ctx.lineWidth = 0.7;
+        // Horizontal line
+        ctx.beginPath(); ctx.moveTo(PL, my); ctx.lineTo(PL + CW, my); ctx.stroke();
+        // Vertical line
+        ctx.beginPath(); ctx.moveTo(mx, PT); ctx.lineTo(mx, PT + CH); ctx.stroke();
+        ctx.setLineDash([]);
+        // Price label on Y axis
+        const cursorPrice = maxP - ((my - PT) / CH) * pRange;
+        ctx.fillStyle = "rgba(30,55,90,0.9)";
+        ctx.fillRect(0, my - 9, PL - 2, 18);
+        ctx.font = "10px 'Courier New'"; ctx.fillStyle = "#88bbff"; ctx.textAlign = "right";
+        ctx.fillText(`$${safeNum(cursorPrice).toLocaleString("en", {maximumFractionDigits:0})}`, PL - 6, my + 4);
+        // Time label on X axis
+        const cursorTime = timeStart + ((mx - PL) / CW) * timeRange;
+        const diffMin = (cursorTime - now) / 60000;
+        let timeLabel;
+        if (Math.abs(diffMin) < 1) {
+          timeLabel = "الآن";
+        } else if (Math.abs(diffMin) >= 60) {
+          const h = Math.floor(Math.abs(diffMin) / 60);
+          const min2 = Math.round(Math.abs(diffMin) % 60);
+          timeLabel = `${diffMin < 0 ? "-" : "+"}${h}س${min2 > 0 ? min2 + "د" : ""}`;
+        } else {
+          timeLabel = `${diffMin > 0 ? "+" : ""}${Math.round(diffMin)}د`;
+        }
+        const labelW = ctx.measureText(timeLabel).width + 12;
+        ctx.fillStyle = "rgba(30,55,90,0.9)";
+        ctx.fillRect(mx - labelW / 2, PT + CH + 2, labelW, 18);
+        ctx.font = "10px 'Courier New'"; ctx.fillStyle = "#88bbff"; ctx.textAlign = "center";
+        ctx.fillText(timeLabel, mx, PT + CH + 14);
+      }
     }
 
     ctx.restore();
@@ -598,8 +832,11 @@ export default function App() {
           <button onClick={() => {
             autoFollow.current = true;
             xViewMin.current = 60;
+            xPanOffset.current = 0;
+            yPanOffset.current = 0;
             yZoom.current = 1;
             setShowFollow(false);
+            saveChartState();
           }} style={{
             position:"absolute", bottom:14, left:14,
             background:"rgba(80,150,255,0.15)",
@@ -615,7 +852,7 @@ export default function App() {
         )}
       </div>
       <div style={{ fontSize:9, color:"#1a2a3a", textAlign:"center" }}>
-        سحب على أرقام السعر (يسار): تكبير/تصغير السعر · سحب على الرسم: تكبير/تصغير الوقت · دبل كليك: إعادة
+        سحب على الرسم: تحريك · عجلة الماوس: تكبير/تصغير · سحب محور السعر: زوم السعر · دبل كليك: إعادة
       </div>
 
       <div style={{ display:"flex", gap:16, fontSize:10, color:"#445566", flexWrap:"wrap", justifyContent:"center" }}>
@@ -625,7 +862,7 @@ export default function App() {
             <span>{l}</span>
           </span>
         ))}
-        <span style={{color:"#223344",marginRight:8}}>· سحب Y: زوم السعر · سحب X: زوم الوقت · دبل كليك: إعادة</span>
+        <span style={{color:"#223344",marginRight:8}}>· سحب: تحريك · عجلة: زوم · دبل كليك: إعادة</span>
       </div>
 
       <style>{`@keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}`}</style>
