@@ -121,6 +121,9 @@ export default function App() {
   const isDraggingX = useRef(false);
   const dragStartX2 = useRef(0);
   const dragStartY2 = useRef(0);
+  // ── X-axis bar drag (zoom time) ───────────────────────────
+  const isDraggingXBar = useRef(false);
+  const dragStartXBar  = useRef(0);
   // ── Pan offsets ────────────────────────────────────────────
   const xPanOffset  = useRef(0);     // horizontal pan offset in ms
   const yPanOffset  = useRef(0);     // vertical pan offset in price units
@@ -333,6 +336,10 @@ export default function App() {
     // ── Chart area drag = pan (X + Y) ──
     const onMouseDownX = (e) => {
       if (e.button !== 0 || !isOnChart(e.clientX)) return;
+      // Don't pan if clicking on X-axis bar area
+      const { y: cy } = getCanvasXY(e.clientX, e.clientY);
+      const H = canvas.height / (dpr.current || 1);
+      if (cy > H - PB) return;
       isDraggingX.current  = true;
       dragStartX2.current  = e.clientX;
       dragStartY2.current  = e.clientY;
@@ -357,7 +364,11 @@ export default function App() {
         ...curTrajs.current.flatMap(t => t.pts.map(p => p.price)),
       ];
       if (allP.length > 0) {
-        const rawMin = Math.min(...allP), rawMax = Math.max(...allP);
+        let rawMin = Infinity, rawMax = -Infinity;
+        for (let i = 0; i < allP.length; i++) {
+          if (allP[i] < rawMin) rawMin = allP[i];
+          if (allP[i] > rawMax) rawMax = allP[i];
+        }
         const halfRange = Math.max((rawMax - rawMin) * 0.15, rawMin * 0.001) + (rawMax - rawMin) / 2;
         const zoomedHalf = halfRange / yZoom.current;
         const pRange = zoomedHalf * 2;
@@ -370,6 +381,33 @@ export default function App() {
       saveChartState();
     };
     const onMouseUpX = () => { isDraggingX.current = false; };
+
+    // ── X-axis bar drag = zoom time ──
+    const isOnXBar = (clientX, clientY) => {
+      const { x, y } = getCanvasXY(clientX, clientY);
+      const H = canvas.height / (dpr.current || 1);
+      return x >= PL && y > H - PB;
+    };
+    const onMouseDownXBar = (e) => {
+      if (e.button !== 0 || !isOnXBar(e.clientX, e.clientY)) return;
+      isDraggingXBar.current = true;
+      dragStartXBar.current  = e.clientX;
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    const onMouseMoveXBar = (e) => {
+      if (!isDraggingXBar.current) return;
+      e.preventDefault();
+      const dx = e.clientX - dragStartXBar.current;
+      const sensitivity = 0.008;
+      // drag right = zoom out (more time), drag left = zoom in (less time)
+      xViewMin.current = Math.max(2, Math.min(1440, xViewMin.current * (1 + dx * sensitivity)));
+      dragStartXBar.current = e.clientX;
+      autoFollow.current = false;
+      setShowFollow(true);
+      saveChartState();
+    };
+    const onMouseUpXBar = () => { isDraggingXBar.current = false; };
 
     // ── Wheel = zoom toward cursor ──
     const onWheel = (e) => {
@@ -405,7 +443,11 @@ export default function App() {
         ...curTrajs.current.flatMap(t => t.pts.map(p => p.price)),
       ];
       if (allP.length > 0) {
-        const rawMin = Math.min(...allP), rawMax = Math.max(...allP);
+        let rawMin = Infinity, rawMax = -Infinity;
+        for (let i = 0; i < allP.length; i++) {
+          if (allP[i] < rawMin) rawMin = allP[i];
+          if (allP[i] > rawMax) rawMax = allP[i];
+        }
         const mid = (rawMin + rawMax) / 2;
         const halfRangeBase = Math.max((rawMax - rawMin) * 0.15, rawMin * 0.001) + (rawMax - rawMin) / 2;
         const oldHalf = halfRangeBase / oldYZoom;
@@ -458,7 +500,11 @@ export default function App() {
         xPanOffset.current -= (dx / CW) * totalTimeMs;
         const allP = priceHist.current.map(p => p.price);
         if (allP.length > 0) {
-          const rawMin = Math.min(...allP), rawMax = Math.max(...allP);
+          let rawMin = Infinity, rawMax = -Infinity;
+          for (let i = 0; i < allP.length; i++) {
+            if (allP[i] < rawMin) rawMin = allP[i];
+            if (allP[i] > rawMax) rawMax = allP[i];
+          }
           const halfRange = Math.max((rawMax - rawMin) * 0.15, rawMin * 0.001) + (rawMax - rawMin) / 2;
           const pRange = (halfRange / yZoom.current) * 2;
           yPanOffset.current += (dy / CH) * pRange;
@@ -501,11 +547,14 @@ export default function App() {
     const onMouseLeave = () => { mousePos.current = null; };
 
     canvas.addEventListener("mousedown",  onMouseDown);
+    canvas.addEventListener("mousedown",  onMouseDownXBar);
     canvas.addEventListener("mousedown",  onMouseDownX);
     window.addEventListener("mousemove",  onMouseMoveY);
+    window.addEventListener("mousemove",  onMouseMoveXBar);
     window.addEventListener("mousemove",  onMouseMoveX);
     window.addEventListener("mousemove",  onMouseMoveCrosshair);
     window.addEventListener("mouseup",    onMouseUpY);
+    window.addEventListener("mouseup",    onMouseUpXBar);
     window.addEventListener("mouseup",    onMouseUpX);
     canvas.addEventListener("wheel",      onWheel, { passive: false });
     canvas.addEventListener("touchstart", onTouchStart, { passive: false });
@@ -516,11 +565,14 @@ export default function App() {
 
     return () => {
       canvas.removeEventListener("mousedown",  onMouseDown);
+      canvas.removeEventListener("mousedown",  onMouseDownXBar);
       canvas.removeEventListener("mousedown",  onMouseDownX);
       window.removeEventListener("mousemove",  onMouseMoveY);
+      window.removeEventListener("mousemove",  onMouseMoveXBar);
       window.removeEventListener("mousemove",  onMouseMoveX);
       window.removeEventListener("mousemove",  onMouseMoveCrosshair);
       window.removeEventListener("mouseup",    onMouseUpY);
+      window.removeEventListener("mouseup",    onMouseUpXBar);
       window.removeEventListener("mouseup",    onMouseUpX);
       canvas.removeEventListener("wheel",      onWheel);
       canvas.removeEventListener("touchstart", onTouchStart);
@@ -572,7 +624,11 @@ export default function App() {
       ctx.restore(); return;
     }
 
-    const rawMin = Math.min(...allP), rawMax = Math.max(...allP);
+    let rawMin = Infinity, rawMax = -Infinity;
+    for (let i = 0; i < allP.length; i++) {
+      if (allP[i] < rawMin) rawMin = allP[i];
+      if (allP[i] > rawMax) rawMax = allP[i];
+    }
     const mid  = (rawMin + rawMax) / 2 + yPanOffset.current;
     const halfRange = Math.max((rawMax - rawMin) * 0.15, rawMin * 0.001) + (rawMax - rawMin) / 2;
     // yZoom: >1 = zoom out (more range), <1 = zoom in (less range)
@@ -659,13 +715,21 @@ export default function App() {
       ctx.fillText(`$${ep.price.toLocaleString("en",{maximumFractionDigits:0})}`, epX + 6, epY + 4);
     }
 
-    // Price history
+    // Price history — break line across gaps > 60s
     if (priceHist.current.length > 1) {
       const hg = ctx.createLinearGradient(PL, 0, nowX, 0);
       hg.addColorStop(0, "rgba(180,210,255,0.08)"); hg.addColorStop(1, "rgba(220,235,255,0.92)");
       ctx.strokeStyle = hg; ctx.lineWidth = 1.8;
       ctx.beginPath();
-      priceHist.current.forEach((p, i) => { const x = tx(p.time), y = ty(p.price); i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); });
+      const GAP_MS = 60000; // 60 seconds
+      priceHist.current.forEach((p, i) => {
+        const x = tx(p.time), y = ty(p.price);
+        if (i === 0 || (p.time - priceHist.current[i - 1].time) > GAP_MS) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
       ctx.stroke();
     }
 
