@@ -356,7 +356,7 @@ export default function App() {
       const CH = rect.height - PT - PB;
       const totalTimeMs = (xViewMin.current + TRAJ_MIN) * 60000;
       // Pan X: convert pixel delta to time delta
-      xPanOffset.current -= (dx / CW) * totalTimeMs;
+      xPanOffset.current += (dx / CW) * totalTimeMs;
       // Pan Y: convert pixel delta to price delta (need current pRange)
       // We approximate pRange from current zoom state
       const allP = [
@@ -497,7 +497,7 @@ export default function App() {
         const CW = rect.width - PL - PR;
         const CH = rect.height - PT - PB;
         const totalTimeMs = (xViewMin.current + TRAJ_MIN) * 60000;
-        xPanOffset.current -= (dx / CW) * totalTimeMs;
+        xPanOffset.current += (dx / CW) * totalTimeMs;
         const allP = priceHist.current.map(p => p.price);
         if (allP.length > 0) {
           let rawMin = Infinity, rawMax = -Infinity;
