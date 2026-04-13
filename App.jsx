@@ -9,6 +9,9 @@ const SB_HEADERS = { "Content-Type": "application/json", "apikey": SB_KEY, "Auth
 const WS_TICKER = "wss://stream.binance.com:9443/ws/btcusdt@ticker";
 const WS_DEPTH  = "wss://stream.binance.com:9443/ws/btcusdt@depth20@1000ms";
 
+// ─── Prediction API ──────────────────────────────────────────
+const API_URL = "https://trajectory-server.onrender.com";
+
 // ─── Constants ───────────────────────────────────────────────
 const TRAJ_MIN  = 10;
 const TRAJ_PTS  = 120;
@@ -171,16 +174,12 @@ export default function App() {
       }
     } catch (_) {}
 
-    Promise.all([
-      sbLoadHistory(),
-      sbCalcAccuracy(60),
-      sbCalcAccuracy(null),
-    ]).then(([rows, acc60, accAll]) => {
+    sbLoadHistory().then(rows => {
       if (rows.length > 0) {
         priceHist.current = rows;
-        setInfo(d => ({ ...d, loaded: true, price: rows.at(-1).price, acc60, accAll }));
+        setInfo(d => ({ ...d, loaded: true, price: rows.at(-1).price }));
       } else {
-        setInfo(d => ({ ...d, loaded: true, acc60, accAll }));
+        setInfo(d => ({ ...d, loaded: true }));
       }
     });
   }, []);
@@ -192,13 +191,20 @@ export default function App() {
     return () => window.removeEventListener("beforeunload", onUnload);
   }, [saveChartState]);
 
-  // Refresh accuracy every 5 minutes
+  // Fetch accuracy from API every 60s
   useEffect(() => {
-    const id = setInterval(() => {
-      Promise.all([sbCalcAccuracy(60), sbCalcAccuracy(null)]).then(([acc60, accAll]) => {
-        setInfo(d => ({ ...d, acc60, accAll }));
-      });
-    }, 5 * 60000);
+    const fetchAccuracy = async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/accuracy`);
+        const data = await res.json();
+        setInfo(d => ({ ...d,
+          acc60: data.last_1h,
+          accAll: data.all_time,
+        }));
+      } catch (_) {}
+    };
+    fetchAccuracy();
+    const id = setInterval(fetchAccuracy, 60000);
     return () => clearInterval(id);
   }, []);
 
@@ -210,24 +216,56 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
-  // ── Trajectory builder every 10s ─────────────────────────
+  // ── Trajectory from API every 10s (fallback to local) ────
   useEffect(() => {
-    const id = setInterval(() => {
-      const price = livePrice.current;
-      if (!price) return;
-      const now = Date.now();
-      const min = Math.floor(now / 60000);
-      if (lastMin.current !== null && min !== lastMin.current) {
-        cloudTrajs.current = [...cloudTrajs.current, ...curTrajs.current]
-          .filter(t => now - t.t0 < 5 * 60000);
-        curTrajs.current = [];
+    const id = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/prediction`);
+        const data = await res.json();
+        if (data.error || !data.trajectory) return;
+
+        const now = Date.now();
+        const min = Math.floor(now / 60000);
+
+        if (lastMin.current !== null && min !== lastMin.current) {
+          cloudTrajs.current = [...cloudTrajs.current, ...curTrajs.current]
+            .filter(t => now - t.t0 < 5 * 60000);
+          curTrajs.current = [];
+        }
+        lastMin.current = min;
+
+        const pts = data.trajectory.map(p => ({ time: p.time, price: p.price }));
+        curTrajs.current.push({ t0: now, pts });
+        if (curTrajs.current.length > 6) curTrajs.current.shift();
+
+        // Update accuracy display
+        if (data.confidence !== undefined) {
+          setInfo(d => ({ ...d,
+            predDirection: data.direction,
+            predConfidence: data.confidence,
+            predMethod: data.method,
+          }));
+        }
+      } catch (e) {
+        console.debug("Prediction fetch failed:", e);
+        // Fallback to local calculation
+        const price = livePrice.current;
+        if (price) {
+          const now = Date.now();
+          const min = Math.floor(now / 60000);
+          if (lastMin.current !== null && min !== lastMin.current) {
+            cloudTrajs.current = [...cloudTrajs.current, ...curTrajs.current]
+              .filter(t => now - t.t0 < 5 * 60000);
+            curTrajs.current = [];
+          }
+          lastMin.current = min;
+          const imb = calcImbalance(priceHist.current);
+          const pts = calcTrajectory(price, imb, now);
+          curTrajs.current.push({ t0: now, pts });
+          if (curTrajs.current.length > 6) curTrajs.current.shift();
+        }
       }
-      lastMin.current = min;
-      const imb = calcImbalance(priceHist.current);
-      const pts = calcTrajectory(price, imb, now);
-      curTrajs.current.push({ t0: now, pts });
-      if (curTrajs.current.length > 6) curTrajs.current.shift();
-    }, UPDATE_MS);
+    }, 10000);
     return () => clearInterval(id);
   }, []);
 
