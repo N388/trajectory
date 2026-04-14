@@ -127,6 +127,7 @@ export default function App() {
   // ── X-axis bar drag (zoom time) ───────────────────────────
   const isDraggingXBar = useRef(false);
   const dragStartXBar  = useRef(0);
+  const isDraggingTime = useRef(false);
   // ── Pan offsets ────────────────────────────────────────────
   const xPanOffset  = useRef(0);     // horizontal pan offset in ms
   const yPanOffset  = useRef(0);     // vertical pan offset in price units
@@ -141,6 +142,8 @@ export default function App() {
     connected: false, error: null, loaded: false,
     acc60: null,   // accuracy last 60 min
     accAll: null,  // accuracy all time
+    predDirection: null, predConfidence: 0, predMethod: null,
+    obi: undefined, rsi: 0, atr: 0,
   });
 
   // ── localStorage persistence ────────────────────────────
@@ -246,6 +249,14 @@ export default function App() {
             predMethod: data.method,
           }));
         }
+        // Also fetch features for display
+        try {
+          const fRes = await fetch(`${API_URL}/api/features`);
+          const fData = await fRes.json();
+          if (fData.obi !== undefined) {
+            setInfo(d => ({ ...d, obi: fData.obi, rsi: fData.rsi_14, atr: fData.atr_pct }));
+          }
+        } catch(_) {}
       } catch (e) {
         console.debug("Prediction fetch failed:", e);
         // Fallback to local calculation
@@ -373,18 +384,34 @@ export default function App() {
 
     // ── Chart area drag = pan (X + Y) ──
     const onMouseDownX = (e) => {
-      if (e.button !== 0 || !isOnChart(e.clientX)) return;
-      // Don't pan if clicking on X-axis bar area
-      const { y: cy } = getCanvasXY(e.clientX, e.clientY);
-      const H = canvas.height / (dpr.current || 1);
-      if (cy > H - PB) return;
-      isDraggingX.current  = true;
-      dragStartX2.current  = e.clientX;
-      dragStartY2.current  = e.clientY;
+      if (e.button !== 0) return;
+      const { x, y } = getCanvasXY(e.clientX, e.clientY);
+      const H = canvas.getBoundingClientRect().height;
+      if (x < PL) return; // Y-axis area, handled separately
+      if (y > H - PB) {
+        // Time axis bar - drag to zoom horizontally
+        isDraggingTime.current = true;
+        dragStartX2.current = e.clientX;
+        e.preventDefault();
+        return;
+      }
+      // Normal chart area - pan
+      isDraggingX.current = true;
+      dragStartX2.current = e.clientX;
+      dragStartY2.current = e.clientY;
       e.preventDefault();
       e.stopPropagation();
     };
     const onMouseMoveX = (e) => {
+      if (isDraggingTime.current) {
+        e.preventDefault();
+        const dx = e.clientX - dragStartX2.current;
+        const zoomFactor = 1 - dx * 0.003;
+        xViewMin.current = Math.max(2, Math.min(1440, xViewMin.current * zoomFactor));
+        dragStartX2.current = e.clientX;
+        saveChartState();
+        return;
+      }
       if (!isDraggingX.current) return;
       e.preventDefault();
       const dx = e.clientX - dragStartX2.current;
@@ -418,7 +445,7 @@ export default function App() {
       setShowFollow(true);
       saveChartState();
     };
-    const onMouseUpX = () => { isDraggingX.current = false; };
+    const onMouseUpX = () => { isDraggingX.current = false; isDraggingTime.current = false; };
 
     // ── X-axis bar drag = zoom time ──
     const isOnXBar = (clientX, clientY) => {
@@ -928,6 +955,20 @@ export default function App() {
         </div>
       </div>
 
+      {info.obi !== undefined && (
+        <div style={{ width:"100%", maxWidth:880 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:9, color:"#334455", marginBottom:3 }}>
+            <span style={{color: info.obi > 0 ? "#009944" : "#993344"}}>
+              OBI: {info.obi > 0 ? "ضغط شراء" : "ضغط بيع"} ({(Math.abs(info.obi)*100).toFixed(0)}%)
+            </span>
+            {info.rsi > 0 && <span style={{color: info.rsi > 70 ? "#ff4466" : info.rsi < 30 ? "#00ff88" : "#556677"}}>RSI: {info.rsi.toFixed(0)}</span>}
+          </div>
+          <div style={{ display:"flex", height:3, borderRadius:2, overflow:"hidden", background:"rgba(255,255,255,0.03)" }}>
+            <div style={{ width:`${Math.max(2, (0.5 + info.obi/2) * 100)}%`, background: info.obi > 0 ? "linear-gradient(90deg,#004422,#00aa55)" : "linear-gradient(90deg,#aa2233,#440011)", transition:"width 0.8s ease" }} />
+          </div>
+        </div>
+      )}
+
       <div style={{ width:"100%", maxWidth:880, position:"relative", flex:1, minHeight:0, display:"flex", flexDirection:"column" }}>
         <canvas ref={canvasRef} style={{ width:"100%", flex:1, minHeight:0, borderRadius:8, border:"1px solid rgba(255,255,255,0.04)", display:"block", cursor:"crosshair", touchAction:"none", userSelect:"none" }} />
         {showFollow && (
@@ -951,6 +992,40 @@ export default function App() {
           }}>
             ◎ العودة للسعر الحالي
           </button>
+        )}
+        {info.predDirection && (
+          <div style={{
+            position:"absolute", top:8, right:8,
+            background:"rgba(8,12,24,0.85)",
+            border:"1px solid rgba(255,255,255,0.08)",
+            borderRadius:8, padding:"8px 14px",
+            backdropFilter:"blur(6px)",
+            fontFamily:"'Courier New',monospace",
+            fontSize:11, lineHeight:1.6,
+            display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2,
+          }}>
+            <div style={{display:"flex",alignItems:"center",gap:6}}>
+              <span style={{color:"#556677",fontSize:9}}>التوقع</span>
+              <span style={{
+                color: info.predDirection === "up" ? "#00ff88" : info.predDirection === "down" ? "#ff4466" : "#556677",
+                fontWeight:"bold", fontSize:14,
+              }}>
+                {info.predDirection === "up" ? "▲ صعود" : info.predDirection === "down" ? "▼ هبوط" : "— محايد"}
+              </span>
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:6}}>
+              <span style={{color:"#556677",fontSize:9}}>الثقة</span>
+              <span style={{
+                color: info.predConfidence > 0.4 ? "#00ff88" : info.predConfidence > 0.2 ? "#ffcc00" : "#556677",
+                fontWeight:"bold",
+              }}>
+                {(info.predConfidence * 100).toFixed(0)}%
+              </span>
+            </div>
+            <div style={{fontSize:9,color:"#334455"}}>
+              {info.predMethod === "ml" ? "🧠 ML" : "📊 قواعد"}
+            </div>
+          </div>
         )}
       </div>
       <div style={{ fontSize:9, color:"#1a2a3a", textAlign:"center" }}>
