@@ -789,11 +789,10 @@ export default function App() {
       const GAP_MS = 60000; // 60 seconds
       priceHist.current.forEach((p, i) => {
         const x = tx(p.time), y = ty(p.price);
-        if (i === 0 || (p.time - priceHist.current[i - 1].time) > GAP_MS) {
-          ctx.moveTo(x, y);
-        } else {
-          ctx.lineTo(x, y);
-        }
+        if (i === 0) { ctx.moveTo(x, y); return; }
+        const gap = p.time - priceHist.current[i-1].time;
+        const priceJump = Math.abs(p.price - priceHist.current[i-1].price) / priceHist.current[i-1].price;
+        if (gap > 60000 || priceJump > 0.005) { ctx.moveTo(x, y); } else { ctx.lineTo(x, y); }
       });
       ctx.stroke();
     }
@@ -836,7 +835,9 @@ export default function App() {
 
     // X labels — iterate over visible time range with nice intervals
     ctx.textAlign = "center";
-    const step = totalView <= 30 ? 2 : totalView <= 120 ? 10 : totalView <= 360 ? 30 : 60;
+    let step = totalView <= 30 ? 2 : totalView <= 120 ? 10 : totalView <= 360 ? 30 : 60;
+    const pixelsPerMin = CW / totalView;
+    if (pixelsPerMin * step < 45) step = Math.ceil(45 / pixelsPerMin);
     const stepMs = step * 60000;
     {
       const firstLabel = Math.floor(timeStart / stepMs) * stepMs;
